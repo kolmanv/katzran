@@ -1,0 +1,7 @@
+# Converter for models/convert.sh (runs in GitHub Actions; torch comes from the CPU-only index first)
+optimum-intel==2.2.0
+openvino==2026.4.1
+openvino-tokenizers==2026.4.1.0
+openvino-genai==2026.4.1.0
+nncf==3.4.0
+transformers>=4.51,<5.6

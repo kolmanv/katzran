@@ -1,0 +1,46 @@
+# Converts the Whisper models to OpenVINO IR and publishes them as a release; katzran downloads them from there
+# and checks them against models/models.sha256. Needs more RAM than the server has, hence here.
+# Rerun (with a new tag) only when a source model gets a new version or a new OpenVINO needs a fresh export.
+name: models
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag
+        default: models-1
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - env: {GH_TOKEN: "${{ github.token }}", TAG: "${{ inputs.tag }}"}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes "Whisper models in OpenVINO IR, converted by the models workflow (run ${{ github.run_id }}).
+          he-turbo: ivrit-ai/whisper-large-v3-turbo (Apache-2.0, by ivrit.ai). general-turbo: openai/whisper-large-v3-turbo (MIT, by OpenAI).
+          Revisions are in .github/workflows/models.yml."
+  convert:
+    needs: release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - {name: he-turbo, repo: ivrit-ai/whisper-large-v3-turbo, rev: f33172a8c3c6efbc040a7200e00835257cac0447}
+          - {name: general-turbo, repo: openai/whisper-large-v3-turbo, rev: 41f01f3fe87f28c78e2fbf8b568835947dd65ed9}
+        format: [int8, fp16]
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          python3 -m venv /tmp/venv && . /tmp/venv/bin/activate
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q -r models/requirements.txt
+          models/convert.sh "${{ matrix.model.repo }}" "${{ matrix.model.rev }}" "${{ matrix.format }}" "$NAME"
+          tar -cf "$NAME.tar" "$NAME" && sha256sum "$NAME.tar" | tee "$NAME.tar.sha256"
+          gh release upload "${{ inputs.tag }}" "$NAME.tar" "$NAME.tar.sha256" --clobber
+        env:
+          NAME: ${{ matrix.model.name }}-${{ matrix.format }}-ov
+          GH_TOKEN: ${{ github.token }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
