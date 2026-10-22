@@ -41,13 +41,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: |
+          # a release is write-once (its checksums are in checksums/models.sha256): to rebuild, bump models/RELEASE
+          if gh release view "${{ needs.tag.outputs.tag }}" --json assets --jq '.assets[].name' | grep -qx "$NAME.tar"; then
+            echo "$NAME.tar is already in the release"; exit 0
+          fi
           python3 -m venv /tmp/venv && . /tmp/venv/bin/activate
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
           pip install -q -r models/requirements.txt
           pip uninstall -q -y torchvision  # pulled in from PyPI for the wrong torch build; Whisper does not need it
           models/convert.sh "${{ matrix.model.repo }}" "${{ matrix.model.rev }}" "${{ matrix.format }}" "$NAME"
           tar -cf "$NAME.tar" "$NAME" && sha256sum "$NAME.tar" | tee "$NAME.tar.sha256"
-          gh release upload "${{ needs.tag.outputs.tag }}" "$NAME.tar" "$NAME.tar.sha256" --clobber
+          gh release upload "${{ needs.tag.outputs.tag }}" "$NAME.tar" "$NAME.tar.sha256"
         env:
           NAME: ${{ matrix.model.name }}-${{ matrix.format }}-ov
           GH_TOKEN: ${{ github.token }}
