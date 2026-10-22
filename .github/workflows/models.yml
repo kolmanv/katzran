@@ -1,12 +1,12 @@
 # Converts the Whisper models to OpenVINO IR and publishes them as a release; katzran downloads them from there
-# and checks them against models/models.sha256. Needs more RAM than the server has, hence here.
+# and checks them against checksums/models.sha256. Needs more RAM than the server has, hence here.
 # Runs when this file or models/ changes. Rerun only when a source model gets a new version or a new OpenVINO
 # needs a fresh export: change the revision or requirements and bump models/RELEASE (the release tag).
 name: models
 on:
   push:
     branches: [main]
-    paths: [".github/workflows/models.yml", "models/**"]
+    paths: [".github/workflows/models.yml", "models/**"]  # checksums/ is outside on purpose
 permissions:
   contents: write
 jobs:

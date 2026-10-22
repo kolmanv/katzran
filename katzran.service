@@ -1,0 +1,23 @@
+[Unit]
+Description=katzran speech-to-text (stateless)
+After=network-online.target
+
+[Service]
+User=katzran
+Group=katzran
+SupplementaryGroups=render
+EnvironmentFile=-/etc/katzran/katzran.env
+Environment=HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+ExecStart=/opt/katzran/venv/bin/python /opt/katzran/katzran.py
+Restart=on-failure
+RestartSec=10
+# Audio and transcripts must never reach the disk: no swap, nothing writable but the GPU kernel cache
+MemorySwapMax=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/cache/katzran
+
+[Install]
+WantedBy=multi-user.target
