@@ -1,28 +1,35 @@
 # Converts the Whisper models to OpenVINO IR and publishes them as a release; katzran downloads them from there
 # and checks them against models/models.sha256. Needs more RAM than the server has, hence here.
-# Rerun (with a new tag) only when a source model gets a new version or a new OpenVINO needs a fresh export.
+# Runs when this file or models/ changes. Rerun only when a source model gets a new version or a new OpenVINO
+# needs a fresh export: change the revision or requirements and bump models/RELEASE (the release tag).
 name: models
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: release tag
-        default: models-1
-        required: true
+  push:
+    branches: [main]
+    paths: [".github/workflows/models.yml", "models/**"]
 permissions:
   contents: write
 jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: t
+        run: echo "tag=$(cat models/RELEASE)" >> "$GITHUB_OUTPUT"
   release:
+    needs: tag
     runs-on: ubuntu-24.04
     steps:
-      - env: {GH_TOKEN: "${{ github.token }}", TAG: "${{ inputs.tag }}"}
+      - env: {GH_TOKEN: "${{ github.token }}", TAG: "${{ needs.tag.outputs.tag }}"}
         run: |
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --title "$TAG" --notes "Whisper models in OpenVINO IR, converted by the models workflow (run ${{ github.run_id }}).
           he-turbo: ivrit-ai/whisper-large-v3-turbo (Apache-2.0, by ivrit.ai). general-turbo: openai/whisper-large-v3-turbo (MIT, by OpenAI).
           Revisions are in .github/workflows/models.yml."
   convert:
-    needs: release
+    needs: [tag, release]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -39,7 +46,7 @@ jobs:
           pip install -q -r models/requirements.txt
           models/convert.sh "${{ matrix.model.repo }}" "${{ matrix.model.rev }}" "${{ matrix.format }}" "$NAME"
           tar -cf "$NAME.tar" "$NAME" && sha256sum "$NAME.tar" | tee "$NAME.tar.sha256"
-          gh release upload "${{ inputs.tag }}" "$NAME.tar" "$NAME.tar.sha256" --clobber
+          gh release upload "${{ needs.tag.outputs.tag }}" "$NAME.tar" "$NAME.tar.sha256" --clobber
         env:
           NAME: ${{ matrix.model.name }}-${{ matrix.format }}-ov
           GH_TOKEN: ${{ github.token }}
