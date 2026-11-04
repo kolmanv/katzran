@@ -9,8 +9,9 @@ SR = k.SR
 plan = {}  # job id -> language of each piece, in order
 
 
-CODE = {"he": 1, "ru": 2, "en": 3}
-LANG = {v: k for k, v in CODE.items()}
+CODE = {"he": 1, "ru": 2, "en": 3, "he~": 4}  # he~: Hebrew with an accent the small detector hears as Russian
+LANG = {1: "he", 2: "ru", 3: "en", 4: "ru"}    # what the detector says
+TRUTH = {1: "he", 2: "ru", 3: "en", 4: "he"}   # what a transcription model left to choose hears
 
 
 class Fake:
@@ -33,7 +34,8 @@ class Fake:
         n = sorted({int(x) // 10 for x in np.unique(chunk)})
         self.order.append((n, name))
         time.sleep(0.01)
-        return {"lang": lang, "model": name, "text": f"{lang} piece {n}"}
+        lang = lang or TRUTH[int(np.unique(chunk)[0]) % 10]
+        return {"lang": lang, "model": name, "text": f"{lang} piece {n} by {name}"}
 
     def unload_if_idle(self):
         pass
@@ -79,7 +81,7 @@ def switch_inside():
     run(f, lambda: k.jobs["w"]["status"] == "done")
     segs = k.jobs["w"]["segments"]
     assert [(s["lang"], s["model"]) for s in segs] == [("he", "he"), ("ru", "general")], segs
-    assert segs[0]["text"] == "he piece [0, 1]", segs
+    assert segs[0]["text"] == "he piece [0, 1] by he", segs
     print("PASS switch inside a window: split into", [(s["lang"], s["start"], s["end"]) for s in segs])
 
 
@@ -100,10 +102,21 @@ def note_first():
           "s before the meeting finished; loads", f.loads)
 
 
+def accent():
+    """Hebrew the detector is sure is Russian: the general model hears Hebrew, so the Hebrew model's reading wins."""
+    f = Fake()
+    add_job("a", ["he~", "ru"], 1)
+    run(f, lambda: k.jobs["a"]["status"] == "done")
+    segs = k.jobs["a"]["segments"]
+    assert [(s["lang"], s["model"]) for s in segs] == [("he", "he"), ("ru", "general")], segs
+    assert "alt" not in segs[0] and segs[0]["detected"][0][0] == "ru", segs
+    print("PASS accent: detector said", segs[0]["detected"][0], "-> read by", segs[0]["model"])
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         globals()[sys.argv[1]]()
     else:
         import subprocess
-        for t in ("mixed", "switch_inside", "note_first"):  # separate processes: the workers are global
+        for t in ("mixed", "switch_inside", "note_first", "accent"):  # separate processes: the workers are global
             subprocess.run([sys.executable, __file__, t], check=True)

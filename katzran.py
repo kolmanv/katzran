@@ -12,7 +12,10 @@ How a file is transcribed: speech is cut at pauses and packed into windows of up
 windows, so a short piece would cost as much as a full one). A small model on the CPU detects each window's language
 while the GPU transcribes. Hebrew goes to the Hebrew model, other languages to the general model. A window that may
 switch language is re-detected part by part (between pauses) and regrouped by language; a part that may still be
-either goes to both models, and the less likely reading is kept as "alt".
+either goes to both models, and the less likely reading is kept as "alt". The small detector is easily fooled by
+short notes and accents (Hebrew with a Russian accent reads as Russian), so a piece it sends to the general model is
+transcribed there with the model's own language detection; if what comes back is Hebrew (the three languages have
+different scripts), the piece also goes to the Hebrew model, whose reading leads.
 Memory over speed: one transcription model is on the GPU at a time (loading takes seconds from the compiled cache),
 and pieces are grouped by model, so a long file switches at most once. The job with the least audio left goes first,
 so a voice note never waits behind a long meeting. Idle for IDLE_UNLOAD seconds, all models leave memory.
@@ -109,8 +112,18 @@ class Models:
         return sorted(((lang, p / total) for lang, p in probs), key=lambda x: -x[1])
 
     def transcribe(self, name, chunk, lang):
-        r = self.asr_model(name).generate(chunk.tolist(), language=f"<|{lang}|>", task="transcribe")
-        return {"lang": lang, "model": name, "text": r.texts[0].strip()}
+        """lang None: the model detects the language itself, and the script of its text says which it chose."""
+        opts = {"language": f"<|{lang}|>"} if lang else {}
+        text = self.asr_model(name).generate(chunk.tolist(), task="transcribe", **opts).texts[0].strip()
+        return {"lang": lang or script(text), "model": name, "text": text}
+
+
+def script(text):
+    """he, ru or en by the letters most used in text; None if it has none of them."""
+    counts = {"he": sum("\u0590" <= c <= "\u05ff" for c in text), "ru": sum("\u0400" <= c <= "\u04ff" for c in text),
+              "en": sum(c.isascii() and c.isalpha() for c in text)}
+    lang = max(counts, key=counts.get)
+    return lang if counts[lang] else None
 
 
 def trim():
@@ -119,14 +132,16 @@ def trim():
 
 
 def route(probs):
-    """Which models a piece goes to: {model: language}."""
+    """Which models a piece goes to: {model: language}. None: the general model detects the language itself (only when
+    Hebrew is allowed: if it hears Hebrew, the Hebrew model runs too)."""
     top, p = probs[0]
+    general = {"general": None if "he" in dict(probs) else top}
     if len(probs) == 1 or p >= SURE:
-        return {"he": "he"} if top == "he" else {"general": top}
+        return {"he": "he"} if top == "he" else general
     other = next(lang for lang, _ in probs if lang != "he")
     if top == "he" or dict(probs).get("he", 0) >= 1 - SURE:
         return {"he": "he", "general": other}
-    return {"general": top}
+    return general
 
 
 def windows(audio):
@@ -243,6 +258,15 @@ def gpu_worker(models):
         try:
             result = models.transcribe(model, speech(job["audio"], p), lang)
             with lock:
+                if lang is None:  # the general model chose the language
+                    heard = result["lang"] = result["lang"] or p["probs"][0][0]
+                    if heard not in job["languages"]:  # not one we expect: transcribe as the detector said
+                        p["todo"]["general"] = p["probs"][0][0]
+                        lock.notify_all()
+                        continue
+                    p["heard"] = heard
+                    if heard == "he":
+                        p["todo"]["he"] = "he"
                 p["results"].append(result)
                 check_done(job)
                 lock.notify_all()
@@ -266,10 +290,12 @@ def finish(job):
         if not results:
             continue
         likely = dict(p["probs"])
-        results.sort(key=lambda r: -likely.get(r["lang"], 0))  # the reading in the likelier language leads
+        # the language the general model heard leads, then the likelier one; in Hebrew, the Hebrew model's reading
+        results.sort(key=lambda r: (r["lang"] != p.get("heard", r["lang"]), -likely.get(r["lang"], 0),
+                                    r["model"] != ("he" if r["lang"] == "he" else "general")))
         seg = {"start": round(p["start"] / SR, 1), "end": round(p["end"] / SR, 1), **results[0],
                "detected": [[lang, round(x, 2)] for lang, x in p["probs"][:3]]}
-        if len(results) > 1 and results[1]["text"] != results[0]["text"]:
+        if len(results) > 1 and results[1]["lang"] != results[0]["lang"]:
             seg["alt"] = results[1]
         segments.append(seg)
     job.update(status="done", segments=segments, seconds=round(time.time() - job["started"], 1), done=time.time())

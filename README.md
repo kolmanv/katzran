@@ -15,6 +15,10 @@ English, including recordings that switch language in the middle. Runs on an Int
    to [OpenAI's Whisper turbo](https://huggingface.co/openai/whisper-large-v3-turbo). A window whose language is unclear
    is re-detected part by part and split where the language changes. A part that may be Hebrew or another language
    goes to both models; the less likely reading comes back as `alt`.
+   The small detector is easily fooled by short notes and accents (Hebrew with a Russian accent can read as Russian),
+   so a window it sends to the general model is transcribed there with that model's own language detection. If the
+   text comes back in Hebrew letters (the three languages have different scripts), the Hebrew model runs too and its
+   reading leads; for speech that really isn't Hebrew, this costs nothing extra.
 5. Memory first: one transcription model is on the GPU at a time (it loads in 2–3 s from the compiled cache), work is
    grouped by model so a long file switches at most once, and after 5 idle minutes all models leave memory.
    The job with the least audio left goes first, so a voice note never waits behind a long meeting.
