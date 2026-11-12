@@ -37,7 +37,12 @@ DELETE /jobs/<id>                                                 forget it now
 GET    /health                                                    -> {"ok": true, ...}
 ```
 
-`languages` is optional (default: the server's `LANGUAGES`); one language skips detection. A finished job:
+`languages` is optional (default: the server's `LANGUAGES`); one language skips detection.
+
+Audio longer than `MAX_MINUTES` (default 15) fails with "long audio" unless the job is sent with `&long=1`, and only
+callers listed in `LONG_CALLERS` may send that: an assistant that asks its owner before a long transcription, not a
+gateway that transcribes everything automatically. A GPU call running over `GPU_TIMEOUT` seconds (default 300) means
+the iGPU hung; the service then exits and systemd restarts it, dropping the jobs in memory (callers resend). A finished job:
 
 ```json
 {"id": "...", "status": "done", "duration": 65.5, "seconds": 16.4, "segments": [

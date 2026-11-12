@@ -1,6 +1,7 @@
 """katzran: local speech-to-text. Audio in, text out, nothing kept.
 
     POST   /jobs?languages=he,ru,en   body = the audio file (any format ffmpeg reads, video too) -> {"id", "position"}
+           &long=1                    allows audio over MAX_MINUTES, for callers in LONG_CALLERS only
     GET    /jobs/<id>                 -> {"status": "queued" | "working" | "done" | "failed", "segments": [...], ...}
     DELETE /jobs/<id>                 forget it now (otherwise: 10 minutes after the result is first read, 1 hour at most)
     GET    /health                    no token needed
@@ -18,7 +19,8 @@ transcribed there with the model's own language detection; if what comes back is
 different scripts), the piece also goes to the Hebrew model, whose reading leads.
 Memory over speed: one transcription model is on the GPU at a time (loading takes seconds from the compiled cache),
 and pieces are grouped by model, so a long file switches at most once. The job with the least audio left goes first,
-so a voice note never waits behind a long meeting. Idle for IDLE_UNLOAD seconds, all models leave memory.
+so a voice note never waits behind a long meeting. Idle for IDLE_UNLOAD seconds, all models leave memory. A GPU
+call running over GPU_TIMEOUT seconds means the GPU hung: the service exits and systemd restarts it.
 
 Audio and results live only in memory (the service runs with swap off). Logs hold caller, size, duration, timing.
 """
@@ -55,11 +57,15 @@ DETECTOR_THREADS = int(env("DETECTOR_THREADS", "2"))
 LANGUAGES = env("LANGUAGES", "he,ru,en").split(",")
 SURE = float(env("LANGUAGE_SURE", "0.8"))  # below this, a piece that may be Hebrew or another language runs on both
 MAX_MB, MAX_HOURS = int(env("MAX_MB", "300")), float(env("MAX_HOURS", "3"))
+# Longer audio costs GPU time worth a decision: only with long=1, from callers trusted to have asked the owner.
+MAX_MINUTES = float(env("MAX_MINUTES", "15"))
+LONG_CALLERS = {c for c in env("LONG_CALLERS", "").split(",") if c}
 TOKENS = env("TOKENS", "/etc/katzran/tokens")
 PORT = int(env("PORT", "9000"))
 SR, WINDOW, MIN_PART = 16000, 28, 1.5  # seconds of speech per window; parts shorter than MIN_PART aren't detected alone
 KEEP_DONE, KEEP_READ = 3600, 600
 IDLE_UNLOAD = int(env("IDLE_UNLOAD", "300"))
+GPU_TIMEOUT = int(env("GPU_TIMEOUT", "300"))  # one window takes seconds; a call this long means the GPU hung
 
 jobs: dict[str, dict] = {}
 lock = threading.Condition()
@@ -72,6 +78,7 @@ class Models:
 
     def __init__(self):
         self.detector, self.asr, self.asr_name, self.used = None, None, None, time.time()
+        self.busy_since = None  # start of the GPU call in progress
         self.lock = threading.Lock()  # loading and unloading vs. the janitor
 
     def detect_model(self):
@@ -114,7 +121,12 @@ class Models:
     def transcribe(self, name, chunk, lang):
         """lang None: the model detects the language itself, and the script of its text says which it chose."""
         opts = {"language": f"<|{lang}|>"} if lang else {}
-        text = self.asr_model(name).generate(chunk.tolist(), task="transcribe", **opts).texts[0].strip()
+        asr = self.asr_model(name)
+        self.busy_since = time.time()
+        try:
+            text = asr.generate(chunk.tolist(), task="transcribe", **opts).texts[0].strip()
+        finally:
+            self.busy_since = None
         return {"lang": lang or script(text), "model": name, "text": text}
 
 
@@ -207,6 +219,9 @@ def cpu_worker(models):
                 audio = decode_audio(io.BytesIO(job.pop("data")), sampling_rate=SR)
                 if len(audio) > MAX_HOURS * 3600 * SR:
                     raise ValueError(f"longer than {MAX_HOURS} hours")
+                if len(audio) > MAX_MINUTES * 60 * SR and not job.get("long"):
+                    raise ValueError(f"long audio: {len(audio) / SR / 60:.0f} min is over {MAX_MINUTES:g} min; "
+                                     "it needs long=1 (the owner's approval)")
                 with lock:
                     job.update(status="working", audio=audio, duration=round(len(audio) / SR, 1),
                                pieces=windows(audio), started=time.time())
@@ -318,6 +333,12 @@ def janitor(models):
     while True:
         time.sleep(30)
         now = time.time()
+        busy = models.busy_since
+        if busy and now - busy > GPU_TIMEOUT:
+            # A hung GPU call never returns (seen: an i915 fence timeout left OpenVINO waiting for hours), and every
+            # job queues behind it. Exit so systemd restarts the service; callers see their jobs gone and resend.
+            log.error("GPU call running for %.0fs (over GPU_TIMEOUT): exiting to restart", now - busy)
+            os._exit(1)
         with lock:
             for jid in [k for k, j in jobs.items() if j.get("done") and (now - j["done"] > KEEP_DONE or
                                                                           now - j.get("read", now) > KEEP_READ)]:
@@ -368,7 +389,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self.reply(200, {"ok": True, "jobs": len(jobs), "variant": VARIANT, "device": DEVICE})
+            busy = models.busy_since
+            return self.reply(200, {"ok": True, "jobs": len(jobs), "variant": VARIANT, "device": DEVICE,
+                                    "gpu_call_s": round(time.time() - busy) if busy else 0})
         who = caller(self.headers)
         if not who:
             return self.reply(401, {"error": "missing or unknown token"})
@@ -399,7 +422,11 @@ class Handler(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length") or 0)
         if not 0 < size <= MAX_MB * 2**20:
             return self.reply(413, {"error": f"send the audio as the request body, up to {MAX_MB} MB"})
-        langs = (parse_qs(url.query).get("languages") or [",".join(LANGUAGES)])[0].split(",")
+        query = parse_qs(url.query)
+        long = (query.get("long") or ["0"])[0] in ("1", "true")
+        if long and who not in LONG_CALLERS:
+            return self.reply(403, {"error": f"long audio (over {MAX_MINUTES:g} min) isn't allowed for {who}"})
+        langs = (query.get("languages") or [",".join(LANGUAGES)])[0].split(",")
         langs = [lang for lang in langs if lang]
         if not langs:
             return self.reply(400, {"error": "languages: comma-separated codes, e.g. he,ru,en"})
@@ -407,10 +434,11 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             jid = uuid.uuid4().hex
             jobs[jid] = {"id": jid, "caller": who, "status": "queued", "data": data, "languages": langs,
-                         "created": time.time()}
+                         "long": long, "created": time.time()}
             lock.notify_all()
             out = public(jobs[jid])
-        log.info("job %s from %s: %.1f MB, languages %s", jid[:8], who, size / 2**20, ",".join(langs))
+        log.info("job %s from %s: %.1f MB, languages %s%s", jid[:8], who, size / 2**20, ",".join(langs),
+                 ", long allowed" if long else "")
         self.reply(202, out)
 
     def log_message(self, *args):
